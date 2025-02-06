@@ -8,7 +8,7 @@ use hbb_common::{
     protobuf::Message as _,
     rendezvous_proto::*,
     sleep,
-    tcp::{new_listener, FramedStream},
+    tcp::{listen_any, FramedStream},
     timeout,
     tokio::{
         self,
@@ -25,6 +25,7 @@ use std::{
     io::prelude::*,
     io::Error,
     net::SocketAddr,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 type Usage = (usize, usize, usize, usize);
@@ -36,13 +37,13 @@ lazy_static::lazy_static! {
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
 }
 
-static mut DOWNGRADE_THRESHOLD: f64 = 0.66;
-static mut DOWNGRADE_START_CHECK: usize = 1800_000; // in ms
-static mut LIMIT_SPEED: usize = 4 * 1024 * 1024; // in bit/s
-static mut TOTAL_BANDWIDTH: usize = 1024 * 1024 * 1024; // in bit/s
-static mut SINGLE_BANDWIDTH: usize = 16 * 1024 * 1024; // in bit/s
-const BLACKLIST_FILE: &'static str = "blacklist.txt";
-const BLOCKLIST_FILE: &'static str = "blocklist.txt";
+static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66
+static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in ms
+static LIMIT_SPEED: AtomicUsize = AtomicUsize::new(4 * 1024 * 1024); // in bit/s
+static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // in bit/s
+static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(16 * 1024 * 1024); // in bit/s
+const BLACKLIST_FILE: &str = "blacklist.txt";
+const BLOCKLIST_FILE: &str = "blocklist.txt";
 
 #[tokio::main(flavor = "multi_thread")]
 pub async fn start(port: &str, key: &str) -> ResultType<()> {
@@ -50,8 +51,8 @@ pub async fn start(port: &str, key: &str) -> ResultType<()> {
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
-            for x in contents.split("\n") {
-                if let Some(ip) = x.trim().split(' ').nth(0) {
+            for x in contents.split('\n') {
+                if let Some(ip) = x.trim().split(' ').next() {
                     BLACKLIST.write().await.insert(ip.to_owned());
                 }
             }
@@ -65,8 +66,8 @@ pub async fn start(port: &str, key: &str) -> ResultType<()> {
     if let Ok(mut file) = std::fs::File::open(BLOCKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
-            for x in contents.split("\n") {
-                if let Some(ip) = x.trim().split(' ').nth(0) {
+            for x in contents.split('\n') {
+                if let Some(ip) = x.trim().split(' ').next() {
                     BLOCKLIST.write().await.insert(ip.to_owned());
                 }
             }
@@ -77,19 +78,21 @@ pub async fn start(port: &str, key: &str) -> ResultType<()> {
         BLOCKLIST_FILE,
         BLOCKLIST.read().await.len()
     );
-    let addr = format!("0.0.0.0:{}", port);
-    log::info!("Listening on tcp {}", addr);
-    let addr2 = format!("0.0.0.0:{}", port.parse::<u16>().unwrap() + 2);
-    log::info!("Listening on websocket {}", addr2);
-    loop {
-        log::info!("Start");
-        io_loop(
-            new_listener(&addr, false).await?,
-            new_listener(&addr2, false).await?,
-            &key,
-        )
-        .await;
-    }
+    let port: u16 = port.parse()?;
+    log::info!("Listening on tcp :{}", port);
+    let port2 = port + 2;
+    log::info!("Listening on websocket :{}", port2);
+    let main_task = async move {
+        loop {
+            log::info!("Start");
+            io_loop(listen_any(port).await?, listen_any(port2).await?, &key).await;
+        }
+    };
+    let listen_signal = crate::common::listen_signal();
+    tokio::select!(
+        res = main_task => res,
+        res = listen_signal => res,
+    )
 }
 
 fn check_params() {
@@ -97,62 +100,60 @@ fn check_params() {
         .map(|x| x.parse::<f64>().unwrap_or(0.))
         .unwrap_or(0.);
     if tmp > 0. {
-        unsafe {
-            DOWNGRADE_THRESHOLD = tmp;
-        }
+        DOWNGRADE_THRESHOLD_100.store((tmp * 100.) as _, Ordering::SeqCst);
     }
-    unsafe { log::info!("DOWNGRADE_THRESHOLD: {}", DOWNGRADE_THRESHOLD) };
+    log::info!(
+        "DOWNGRADE_THRESHOLD: {}",
+        DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100.
+    );
     let tmp = std::env::var("DOWNGRADE_START_CHECK")
         .map(|x| x.parse::<usize>().unwrap_or(0))
         .unwrap_or(0);
     if tmp > 0 {
-        unsafe {
-            DOWNGRADE_START_CHECK = tmp * 1000;
-        }
+        DOWNGRADE_START_CHECK.store(tmp * 1000, Ordering::SeqCst);
     }
-    unsafe { log::info!("DOWNGRADE_START_CHECK: {}s", DOWNGRADE_START_CHECK / 1000) };
+    log::info!(
+        "DOWNGRADE_START_CHECK: {}s",
+        DOWNGRADE_START_CHECK.load(Ordering::SeqCst) / 1000
+    );
     let tmp = std::env::var("LIMIT_SPEED")
         .map(|x| x.parse::<f64>().unwrap_or(0.))
         .unwrap_or(0.);
     if tmp > 0. {
-        unsafe {
-            LIMIT_SPEED = (tmp * 1024. * 1024.) as usize;
-        }
+        LIMIT_SPEED.store((tmp * 1024. * 1024.) as usize, Ordering::SeqCst);
     }
-    unsafe { log::info!("LIMIT_SPEED: {}Mb/s", LIMIT_SPEED as f64 / 1024. / 1024.) };
+    log::info!(
+        "LIMIT_SPEED: {}Mb/s",
+        LIMIT_SPEED.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+    );
     let tmp = std::env::var("TOTAL_BANDWIDTH")
         .map(|x| x.parse::<f64>().unwrap_or(0.))
         .unwrap_or(0.);
     if tmp > 0. {
-        unsafe {
-            TOTAL_BANDWIDTH = (tmp * 1024. * 1024.) as usize;
-        }
+        TOTAL_BANDWIDTH.store((tmp * 1024. * 1024.) as usize, Ordering::SeqCst);
     }
-    unsafe {
-        log::info!(
-            "TOTAL_BANDWIDTH: {}Mb/s",
-            TOTAL_BANDWIDTH as f64 / 1024. / 1024.
-        )
-    };
+
+    log::info!(
+        "TOTAL_BANDWIDTH: {}Mb/s",
+        TOTAL_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+    );
     let tmp = std::env::var("SINGLE_BANDWIDTH")
         .map(|x| x.parse::<f64>().unwrap_or(0.))
         .unwrap_or(0.);
     if tmp > 0. {
-        unsafe {
-            SINGLE_BANDWIDTH = (tmp * 1024. * 1024.) as usize;
-        }
+        SINGLE_BANDWIDTH.store((tmp * 1024. * 1024.) as usize, Ordering::SeqCst);
     }
-    unsafe {
-        log::info!(
-            "SINGLE_BANDWIDTH: {}Mb/s",
-            SINGLE_BANDWIDTH as f64 / 1024. / 1024.
-        )
-    };
+    log::info!(
+        "SINGLE_BANDWIDTH: {}Mb/s",
+        SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+    )
 }
 
 async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
+    use std::fmt::Write;
+
     let mut res = "".to_owned();
-    let mut fds = cmd.trim().split(" ");
+    let mut fds = cmd.trim().split(' ');
     match fds.next() {
         Some("h") => {
             res = format!(
@@ -173,7 +174,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
         }
         Some("blacklist-add" | "ba") => {
             if let Some(ip) = fds.next() {
-                for ip in ip.split("|") {
+                for ip in ip.split('|') {
                     BLACKLIST.write().await.insert(ip.to_owned());
                 }
             }
@@ -183,7 +184,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
                 if ip == "all" {
                     BLACKLIST.write().await.clear();
                 } else {
-                    for ip in ip.split("|") {
+                    for ip in ip.split('|') {
                         BLACKLIST.write().await.remove(ip);
                     }
                 }
@@ -194,13 +195,13 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
                 res = format!("{}\n", BLACKLIST.read().await.get(ip).is_some());
             } else {
                 for ip in BLACKLIST.read().await.clone().into_iter() {
-                    res += &format!("{}\n", ip);
+                    let _ = writeln!(res, "{ip}");
                 }
             }
         }
         Some("blocklist-add" | "Ba") => {
             if let Some(ip) = fds.next() {
-                for ip in ip.split("|") {
+                for ip in ip.split('|') {
                     BLOCKLIST.write().await.insert(ip.to_owned());
                 }
             }
@@ -210,7 +211,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
                 if ip == "all" {
                     BLOCKLIST.write().await.clear();
                 } else {
-                    for ip in ip.split("|") {
+                    for ip in ip.split('|') {
                         BLOCKLIST.write().await.remove(ip);
                     }
                 }
@@ -221,7 +222,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
                 res = format!("{}\n", BLOCKLIST.read().await.get(ip).is_some());
             } else {
                 for ip in BLOCKLIST.read().await.clone().into_iter() {
-                    res += &format!("{}\n", ip);
+                    let _ = writeln!(res, "{ip}");
                 }
             }
         }
@@ -229,76 +230,68 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
                     if v > 0. {
-                        unsafe {
-                            DOWNGRADE_THRESHOLD = v;
-                        }
+                        DOWNGRADE_THRESHOLD_100.store((v * 100.) as _, Ordering::SeqCst);
                     }
                 }
             } else {
-                unsafe {
-                    res = format!("{}\n", DOWNGRADE_THRESHOLD);
-                }
+                res = format!(
+                    "{}\n",
+                    DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100.
+                );
             }
         }
         Some("downgrade-start-check" | "t") => {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<usize>() {
                     if v > 0 {
-                        unsafe {
-                            DOWNGRADE_START_CHECK = v * 1000;
-                        }
+                        DOWNGRADE_START_CHECK.store(v * 1000, Ordering::SeqCst);
                     }
                 }
             } else {
-                unsafe {
-                    res = format!("{}s\n", DOWNGRADE_START_CHECK / 1000);
-                }
+                res = format!("{}s\n", DOWNGRADE_START_CHECK.load(Ordering::SeqCst) / 1000);
             }
         }
         Some("limit-speed" | "ls") => {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
                     if v > 0. {
-                        unsafe {
-                            LIMIT_SPEED = (v * 1024. * 1024.) as _;
-                        }
+                        LIMIT_SPEED.store((v * 1024. * 1024.) as _, Ordering::SeqCst);
                     }
                 }
             } else {
-                unsafe {
-                    res = format!("{}Mb/s\n", LIMIT_SPEED as f64 / 1024. / 1024.);
-                }
+                res = format!(
+                    "{}Mb/s\n",
+                    LIMIT_SPEED.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+                );
             }
         }
         Some("total-bandwidth" | "tb") => {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
                     if v > 0. {
-                        unsafe {
-                            TOTAL_BANDWIDTH = (v * 1024. * 1024.) as _;
-                            limiter.set_speed_limit(TOTAL_BANDWIDTH as _);
-                        }
+                        TOTAL_BANDWIDTH.store((v * 1024. * 1024.) as _, Ordering::SeqCst);
+                        limiter.set_speed_limit(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
                     }
                 }
             } else {
-                unsafe {
-                    res = format!("{}Mb/s\n", TOTAL_BANDWIDTH as f64 / 1024. / 1024.);
-                }
+                res = format!(
+                    "{}Mb/s\n",
+                    TOTAL_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+                );
             }
         }
         Some("single-bandwidth" | "sb") => {
             if let Some(v) = fds.next() {
                 if let Ok(v) = v.parse::<f64>() {
                     if v > 0. {
-                        unsafe {
-                            SINGLE_BANDWIDTH = (v * 1024. * 1024.) as _;
-                        }
+                        SINGLE_BANDWIDTH.store((v * 1024. * 1024.) as _, Ordering::SeqCst);
                     }
                 }
             } else {
-                unsafe {
-                    res = format!("{}Mb/s\n", SINGLE_BANDWIDTH as f64 / 1024. / 1024.);
-                }
+                res = format!(
+                    "{}Mb/s\n",
+                    SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64 / 1024. / 1024.
+                );
             }
         }
         Some("usage" | "u") => {
@@ -306,15 +299,16 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
                 .read()
                 .await
                 .iter()
-                .map(|x| (x.0.clone(), x.1.clone()))
+                .map(|x| (x.0.clone(), *x.1))
                 .collect();
             tmp.sort_by(|a, b| ((b.1).1).partial_cmp(&(a.1).1).unwrap());
             for (ip, (elapsed, total, highest, speed)) in tmp {
-                if elapsed <= 0 {
+                if elapsed == 0 {
                     continue;
                 }
-                res += &format!(
-                    "{}: {}s {:.2}MB {}kb/s {}kb/s {}kb/s\n",
+                let _ = writeln!(
+                    res,
+                    "{}: {}s {:.2}MB {}kb/s {}kb/s {}kb/s",
                     ip,
                     elapsed / 1000,
                     total as f64 / 1024. / 1024. / 8.,
@@ -331,7 +325,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
 
 async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
     check_params();
-    let limiter = <Limiter>::new(unsafe { TOTAL_BANDWIDTH as _ });
+    let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
     loop {
         tokio::select! {
             res = listener.accept() => {
@@ -369,12 +363,12 @@ async fn handle_connection(
     key: &str,
     ws: bool,
 ) {
-    let ip = addr.ip().to_string();
-    if !ws && ip == "127.0.0.1" {
+    let ip = hbb_common::try_into_v4(addr).ip();
+    if !ws && ip.is_loopback() {
         let limiter = limiter.clone();
         tokio::spawn(async move {
             let mut stream = stream;
-            let mut buffer = [0; 64];
+            let mut buffer = [0; 1024];
             if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
                 if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
                     let res = check_cmd(data, limiter).await;
@@ -384,6 +378,7 @@ async fn handle_connection(
         });
         return;
     }
+    let ip = ip.to_string();
     if BLOCKLIST.read().await.get(&ip).is_some() {
         log::info!("{} blocked", ip);
         return;
@@ -397,19 +392,30 @@ async fn handle_connection(
 
 async fn make_pair(
     stream: TcpStream,
-    addr: SocketAddr,
+    mut addr: SocketAddr,
     key: &str,
     limiter: Limiter,
     ws: bool,
 ) -> ResultType<()> {
     if ws {
-        make_pair_(
-            tokio_tungstenite::accept_async(stream).await?,
-            addr,
-            key,
-            limiter,
-        )
-        .await;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let callback = |req: &Request, response: Response| {
+            let headers = req.headers();
+            let real_ip = headers
+                .get("X-Real-IP")
+                .or_else(|| headers.get("X-Forwarded-For"))
+                .and_then(|header_value| header_value.to_str().ok());
+            if let Some(ip) = real_ip {
+                if ip.contains('.') {
+                    addr = format!("{ip}:0").parse().unwrap_or(addr);
+                } else {
+                    addr = format!("[{ip}]:0").parse().unwrap_or(addr);
+                }
+            }
+            Ok(response)
+        };
+        let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+        make_pair_(ws_stream, addr, key, limiter).await;
     } else {
         make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
     }
@@ -420,7 +426,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
     let mut stream = stream;
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
-            if let Some(rendezvous_message::Union::request_relay(rf)) = msg_in.union {
+            if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
                 if !key.is_empty() && rf.licence_key != key {
                     return;
                 }
@@ -469,10 +475,11 @@ async fn relay(
     let mut highest_s = 0;
     let mut downgrade: bool = false;
     let mut blacked: bool = false;
-    let limiter = <Limiter>::new(unsafe { SINGLE_BANDWIDTH as _ });
-    let blacklist_limiter = <Limiter>::new(unsafe { LIMIT_SPEED as _ });
+    let sb = SINGLE_BANDWIDTH.load(Ordering::SeqCst) as f64;
+    let limiter = <Limiter>::new(sb);
+    let blacklist_limiter = <Limiter>::new(LIMIT_SPEED.load(Ordering::SeqCst) as _);
     let downgrade_threshold =
-        (unsafe { SINGLE_BANDWIDTH as f64 * DOWNGRADE_THRESHOLD } / 1000.) as usize; // in bit/ms
+        (sb * DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100. / 1000.) as usize; // in bit/ms
     let mut timer = interval(Duration::from_secs(3));
     let mut last_recv_time = std::time::Instant::now();
     loop {
@@ -489,7 +496,7 @@ async fn relay(
                     total_limiter.consume(nb).await;
                     total += nb;
                     total_s += nb;
-                    if bytes.len() > 0 {
+                    if !bytes.is_empty() {
                         stream.send_raw(bytes.into()).await?;
                     }
                 } else {
@@ -508,7 +515,7 @@ async fn relay(
                     total_limiter.consume(nb).await;
                     total += nb;
                     total_s += nb;
-                    if bytes.len() > 0 {
+                    if !bytes.is_empty() {
                         peer.send_raw(bytes.into()).await?;
                     }
                 } else {
@@ -530,7 +537,7 @@ async fn relay(
             }
             blacked = BLACKLIST.read().await.get(&ip).is_some();
             tm = std::time::Instant::now();
-            let speed = total_s / (n as usize);
+            let speed = total_s / n;
             if speed > highest_s {
                 highest_s = speed;
             }
@@ -540,16 +547,17 @@ async fn relay(
                 (elapsed as _, total as _, highest_s as _, speed as _),
             );
             total_s = 0;
-            if elapsed > unsafe { DOWNGRADE_START_CHECK } && !downgrade {
-                if total > elapsed * downgrade_threshold {
-                    downgrade = true;
-                    log::info!(
-                        "Downgrade {}, exceed downgrade threshold {}bit/ms in {}ms",
-                        id,
-                        downgrade_threshold,
-                        elapsed
-                    );
-                }
+            if elapsed > DOWNGRADE_START_CHECK.load(Ordering::SeqCst)
+                && !downgrade
+                && total > elapsed * downgrade_threshold
+            {
+                downgrade = true;
+                log::info!(
+                    "Downgrade {}, exceed downgrade threshold {}bit/ms in {}ms",
+                    id,
+                    downgrade_threshold,
+                    elapsed
+                );
             }
         }
     }
@@ -566,7 +574,7 @@ fn get_server_sk(key: &str) -> String {
     }
 
     if key == "-" || key == "_" {
-        let (pk, _) = crate::common::gen_sk();
+        let (pk, _) = crate::common::gen_sk(300);
         key = pk;
     }
 
